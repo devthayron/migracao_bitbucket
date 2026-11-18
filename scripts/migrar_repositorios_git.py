@@ -1,18 +1,11 @@
-import argparse
 import logging
 import os
 import subprocess
-import sys
 import tempfile
 from pathlib import Path
 
-RAIZ_PROJETO = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(RAIZ_PROJETO))
-
-from bitbucket_cloud import BitbucketCloud
-
 from config import settings
-from logger import setup_logging
+from scripts.bitbucket_cloud import BitbucketCloud
 from scripts.bitbucket_server import BitbucketServer
 
 logger = logging.getLogger(__name__)
@@ -425,51 +418,3 @@ class MigracaoRepositoriosGit:
                 logger.warning("%s", slug)
 
         logger.info("Processo finalizado.")
-
-
-def configurar_argumentos():
-    parser = argparse.ArgumentParser(
-        description="Migra repositórios Git para o Bitbucket Cloud."
-    )
-
-    grupo = parser.add_mutually_exclusive_group(required=True)
-
-    grupo.add_argument(
-        "--projeto",
-        help="Projeto de origem no Server e destino no Cloud.",
-    )
-
-    grupo.add_argument(
-        "--repo",
-        help="Migra somente um repositório pelo slug, dentro do projeto CRED.",
-    )
-
-    parser.add_argument(
-        "--confirmar",
-        action="store_true",
-        help="Executa a migração real. Sem essa opção, apenas simula.",
-    )
-
-    return parser.parse_args()
-
-
-def main():
-    setup_logging()
-
-    args = configurar_argumentos()
-
-    migracao = MigracaoRepositoriosGit(
-        chave_projeto=args.projeto,
-        slug_repositorio=args.repo,
-        confirmar=args.confirmar,
-    )
-
-    migracao.executar()
-
-
-if __name__ == "__main__":
-    try:
-        main()
-    except Exception:
-        logger.exception("FALHA NA MIGRAÇÃO")
-        raise
