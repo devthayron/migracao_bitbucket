@@ -65,6 +65,22 @@ class BitbucketCloud:
 
         return existentes
 
+    def obter_repositorio(self, slug):
+        url = f"{self.base_url}/repositories/{self.workspace}/{slug}"
+
+        resposta = self.sessao.get(url, timeout=30)
+
+        if resposta.status_code == 404:
+            return None
+
+        if resposta.status_code != 200:
+            raise RuntimeError(
+                f"Falha ao consultar repositório '{slug}': "
+                f"HTTP {resposta.status_code} - {resposta.text}"
+            )
+
+        return resposta.json()
+
     def listar_repositorios_projeto(self, chave_projeto):
         url = f"{self.base_url}/repositories/{self.workspace}"
 

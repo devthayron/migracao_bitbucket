@@ -5,7 +5,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from urllib.parse import urlsplit
 
 RAIZ_PROJETO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(RAIZ_PROJETO))
@@ -14,8 +13,11 @@ from bitbucket_cloud import BitbucketCloud
 
 from config import settings
 from logger import setup_logging
+from scripts.bitbucket_server import BitbucketServer
 
 logger = logging.getLogger(__name__)
+
+PROJETO_ORIGEM = "CRED"
 
 
 class MigracaoRepositoriosGit:
@@ -25,62 +27,88 @@ class MigracaoRepositoriosGit:
         slug_repositorio=None,
         confirmar=False,
     ):
-        self.chave_projeto = chave_projeto
+        self.chave_projeto = (chave_projeto or PROJETO_ORIGEM).upper()
         self.slug_repositorio = slug_repositorio
         self.confirmar = confirmar
-        self.bitbucket = BitbucketCloud()
 
-        self.servidor_origem = self._obter_host_origem()
-        self.porta_origem = settings.BITBUCKET_SERVER_PORT
+        self.bitbucket_server = BitbucketServer()
+        self.bitbucket_cloud = BitbucketCloud()
+
+        self.repositorios_cloud = {}
+
         self.chave_ssh = Path(settings.BITBUCKET_SSH_KEY).expanduser()
 
         self.timeout_clone = 2000
         self.timeout_push = 2000
 
-    def _obter_host_origem(self):
-        url = settings.BITBUCKET_SERVER_URL
-
-        if not url:
-            raise ValueError("BITBUCKET_SERVER_URL não configurada.")
-
-        endereco = url if "://" in url else f"//{url}"
-        servidor = urlsplit(endereco).hostname
-
-        if not servidor:
-            raise ValueError("Não foi possível identificar o servidor de origem.")
-
-        return servidor
+        self.nao_encontrados = []
+        self.projeto_incorreto = []
 
     def executar(self):
+        logger.info("Consultando repositórios no Bitbucket Server...")
+
+        repositorios_origem = self.bitbucket_server.listar_repositorios(PROJETO_ORIGEM)
 
         if self.slug_repositorio:
-            repositorios = self._buscar_repositorio()
+            repositorios_origem = [
+                repo
+                for repo in repositorios_origem
+                if repo.get("slug") == self.slug_repositorio
+            ]
 
-        else:
-            projeto = self.bitbucket.validar_projeto(self.chave_projeto)
+            if not repositorios_origem:
+                raise RuntimeError(
+                    f"Repositório '{self.slug_repositorio}' "
+                    f"não encontrado no projeto {PROJETO_ORIGEM} do Server."
+                )
 
-            repositorios = self.bitbucket.listar_repositorios_projeto(
-                self.chave_projeto
+        if not repositorios_origem:
+            logger.warning("Nenhum repositório encontrado na origem.")
+            return
+
+        logger.info(
+            "Total de repositórios encontrados no Server: %s",
+            len(repositorios_origem),
+        )
+
+        # Consulta individual ou consulta geral no Cloud.
+        if self.slug_repositorio:
+            logger.info(
+                "Consultando repositório '%s' no Bitbucket Cloud...",
+                self.slug_repositorio,
             )
 
-            logger.info("Projeto: %s", projeto.get("name"))
-            logger.info("Chave: %s", projeto.get("key"))
+            repo = self.bitbucket_cloud.obter_repositorio(self.slug_repositorio)
+
+            self.repositorios_cloud = {repo["slug"]: repo} if repo else {}
+
+        else:
+            logger.info("Consultando TODOS os repositórios do Bitbucket Cloud...")
+
+            self.repositorios_cloud = self.bitbucket_cloud.listar_repositorios()
+
+        logger.info(
+            "Total de repositórios encontrados no Cloud: %s",
+            len(self.repositorios_cloud),
+        )
+
+        projeto = self.bitbucket_cloud.validar_projeto(self.chave_projeto)
 
         logger.info("=" * 60)
         logger.info("MIGRAÇÃO DE REPOSITÓRIOS GIT")
         logger.info("=" * 60)
 
-        logger.info("Servidor de origem: %s", self.servidor_origem)
-        logger.info("Workspace destino: %s", self.bitbucket.workspace)
-        logger.info("Total de repositórios: %s", len(repositorios))
+        logger.info("Projeto de origem: %s", PROJETO_ORIGEM)
+        logger.info("Projeto de destino: %s", projeto.get("name"))
+        logger.info("Chave de destino: %s", projeto.get("key"))
+        logger.info("Workspace: %s", self.bitbucket_cloud.workspace)
+
         logger.info(
             "Modo: %s",
             "EXECUÇÃO REAL" if self.confirmar else "SIMULAÇÃO",
         )
 
-        if not repositorios:
-            logger.warning("Nenhum repositório encontrado.")
-            return
+        logger.info("Total na origem: %s", len(repositorios_origem))
 
         migrados = 0
         ignorados = 0
@@ -88,15 +116,31 @@ class MigracaoRepositoriosGit:
         sem_referencias = 0
         erros = 0
 
-        for indice, repo in enumerate(repositorios, start=1):
-            slug = repo.get("slug")
+        for indice, repo_origem in enumerate(
+            repositorios_origem,
+            start=1,
+        ):
+            slug = repo_origem.get("slug")
 
             logger.info("-" * 60)
-            logger.info("[%s/%s] %s", indice, len(repositorios), slug)
+            logger.info(
+                "[%s/%s] %s",
+                indice,
+                len(repositorios_origem),
+                slug,
+            )
             logger.info("-" * 60)
 
             try:
-                status = self._migrar_repositorio(repo)
+                repo_destino = self._validar_repositorio_destino(slug)
+
+                if not repo_destino:
+                    continue
+
+                status = self._migrar_repositorio(
+                    repo_origem,
+                    repo_destino,
+                )
 
                 if status == "MIGRADO":
                     migrados += 1
@@ -112,9 +156,11 @@ class MigracaoRepositoriosGit:
 
                 elif status == "SEM REFERENCIAS":
                     sem_referencias += 1
-                    logger.warning(
-                        "Repositório sem branches e tags. Nenhum envio realizado."
-                    )
+                    logger.warning("Repositório sem branches e tags.")
+
+                elif status == "IGNORADO":
+                    ignorados += 1
+                    logger.warning("Repositório ignorado.")
 
             except Exception:
                 erros += 1
@@ -123,79 +169,107 @@ class MigracaoRepositoriosGit:
                     slug,
                 )
 
-        logger.info("=" * 60)
-        logger.info("RESUMO FINAL")
-        logger.info("=" * 60)
-
-        logger.info("Total consultado:     %s", len(repositorios))
-        logger.info("Migrados:             %s", migrados)
-        logger.info("Já existentes:        %s", ignorados)
-        logger.info("Simulados:            %s", simulados)
-        logger.info("Sem referências:      %s", sem_referencias)
-        logger.info("Erros:                %s", erros)
-
-        logger.info("Processo finalizado.")
-
-    def _buscar_repositorio(self):
-        repositorios = self.bitbucket.listar_repositorios()
-
-        repo = repositorios.get(self.slug_repositorio)
-
-        if not repo:
-            raise RuntimeError(
-                f"Repositório '{self.slug_repositorio}' "
-                "não encontrado no Bitbucket Cloud."
-            )
-
-        return [repo]
-
-    def _migrar_repositorio(self, repo):
-        slug = repo.get("slug")
-
-        if slug == "gs-imagens-iso":
-            return "IGNORADO"
-
-        projeto = repo.get("project", {}).get("key")
-
-        if not projeto:
-            projeto = self.chave_projeto
-
-        if not projeto:
-            raise RuntimeError(
-                f"Não foi possível identificar o projeto do repositório '{slug}'."
-            )
-
-        origem = (
-            f"ssh://git@{self.servidor_origem}:"
-            f"{self.porta_origem}/"
-            f"{projeto.lower()}/{slug}.git"
+        self.exibir_resumo(
+            total=len(repositorios_origem),
+            migrados=migrados,
+            ignorados=ignorados,
+            simulados=simulados,
+            sem_referencias=sem_referencias,
+            erros=erros,
         )
 
-        destino = self._obter_url_destino(repo)
+    def _validar_repositorio_destino(self, slug):
+        repo = self.repositorios_cloud.get(slug)
 
-        logger.info("Projeto: %s", projeto)
+        if not repo:
+            self.nao_encontrados.append(slug)
+
+            logger.warning(
+                "NÃO ENCONTRADO NO CLOUD: %s",
+                slug,
+            )
+
+            return None
+
+        projeto = repo.get("project") or {}
+
+        chave_projeto = projeto.get("key")
+        nome_projeto = projeto.get("name", "SEM NOME")
+
+        if chave_projeto != self.chave_projeto:
+            self.projeto_incorreto.append(
+                {
+                    "slug": slug,
+                    "projeto": nome_projeto,
+                    "chave": chave_projeto,
+                }
+            )
+
+            logger.warning(
+                "PROJETO INCORRETO: %s | Encontrado em: %s (%s) | Esperado: %s",
+                slug,
+                nome_projeto,
+                chave_projeto,
+                self.chave_projeto,
+            )
+
+            return None
+
+        logger.info(
+            "DESTINO VALIDADO: %s | Projeto: %s (%s)",
+            slug,
+            nome_projeto,
+            chave_projeto,
+        )
+
+        return repo
+
+    def _migrar_repositorio(self, repo_origem, repo_destino):
+        slug = repo_origem.get("slug")
+
+        # Exclusão temporária mantida do código original.
+        if slug == "gs-imagens-iso":
+            logger.warning(
+                "Repositório %s está configurado para ser ignorado.",
+                slug,
+            )
+            return "IGNORADO"
+
+        origem = self._obter_url_origem(repo_origem)
+        destino = self._obter_url_destino(repo_destino)
+
         logger.info("Origem: %s", origem)
         logger.info("Destino: %s", destino)
 
-        logger.info("Verificando referências pela API do Bitbucket Cloud...")
+        # Verificação controlada pelo .env.
+        if settings.VERIFICAR_REFERENCIAS_DESTINO:
+            logger.info("Verificando referências no destino...")
 
-        # Verificação de destino existente desativada para permitir atualização.
-        if self._repositorio_possui_referencias(slug):
-            logger.info(
-                "JÁ EXISTENTE - O repositório possui referências Git. "
-                "Migração ignorada."
+            if self._repositorio_possui_referencias(slug):
+                logger.warning(
+                    "JÁ EXISTENTE - O repositório possui referências Git. "
+                    "Migração ignorada."
+                )
+                return "JÁ EXISTENTE"
+
+        else:
+            logger.warning(
+                "Verificação de referências desativada. "
+                "O destino poderá ter referências substituídas ou removidas."
             )
-            return "JÁ EXISTENTE"
-
-        logger.info("Verificação de destino concluída.")
 
         if not self.confirmar:
             logger.info("Comandos que seriam executados:")
+
             logger.info(
                 "git clone --mirror %s <diretorio_temporario>",
                 origem,
             )
-            logger.info("git push --mirror %s", destino)
+
+            logger.info(
+                "git push --mirror %s",
+                destino,
+            )
 
             return "SIMULADO"
 
@@ -241,6 +315,31 @@ class MigracaoRepositoriosGit:
 
         return "MIGRADO"
 
+    def _obter_url_origem(self, repo):
+        clones = repo.get("links", {}).get("clone", [])
+
+        for clone in clones:
+            if clone.get("name") == "ssh":
+                return clone.get("href")
+
+        raise RuntimeError(
+            f"URL SSH de origem não encontrada para '{repo.get('slug')}'."
+        )
+
+    def _obter_url_destino(self, repo):
+        clones = repo.get("links", {}).get("clone", [])
+
+        for clone in clones:
+            if clone.get("name") == "ssh":
+                return clone.get("href")
+
+        raise RuntimeError(
+            f"URL SSH de destino não encontrada para '{repo.get('slug')}'."
+        )
+
+    def _repositorio_possui_referencias(self, slug):
+        return self.bitbucket_cloud.repositorio_possui_referencias(slug)
+
     def _possui_referencias_locais(self, caminho_repositorio):
         resultado = subprocess.run(
             [
@@ -257,18 +356,6 @@ class MigracaoRepositoriosGit:
         )
 
         return bool(resultado.stdout.strip())
-
-    def _repositorio_possui_referencias(self, slug):
-        return self.bitbucket.repositorio_possui_referencias(slug)
-
-    def _obter_url_destino(self, repo):
-        clones = repo.get("links", {}).get("clone", [])
-
-        for clone in clones:
-            if clone.get("name") == "ssh":
-                return clone.get("href")
-
-        raise RuntimeError(f"URL SSH não encontrada para '{repo.get('slug')}'.")
 
     def _executar_comando(self, comando, timeout=90):
         if not self.chave_ssh.exists():
@@ -294,6 +381,51 @@ class MigracaoRepositoriosGit:
                 resultado.stderr.strip() or "Erro ao executar comando Git."
             )
 
+    def exibir_resumo(
+        self,
+        total,
+        migrados,
+        ignorados,
+        simulados,
+        sem_referencias,
+        erros,
+    ):
+        logger.info("=" * 60)
+        logger.info("RESUMO FINAL")
+        logger.info("=" * 60)
+
+        logger.info("Total consultado:          %s", total)
+        logger.info("Migrados:                  %s", migrados)
+        logger.info("Já existentes:             %s", ignorados)
+        logger.info("Simulados:                 %s", simulados)
+        logger.info("Sem referências:           %s", sem_referencias)
+        logger.info("Não encontrados no Cloud:  %s", len(self.nao_encontrados))
+        logger.info("Em projetos diferentes:    %s", len(self.projeto_incorreto))
+        logger.info("Erros:                     %s", erros)
+
+        if self.projeto_incorreto:
+            logger.info("=" * 60)
+            logger.info("REPOSITÓRIOS EM PROJETOS DIFERENTES")
+            logger.info("=" * 60)
+
+            for item in self.projeto_incorreto:
+                logger.warning(
+                    "%s | Projeto: %s | Chave: %s",
+                    item["slug"],
+                    item["projeto"],
+                    item["chave"],
+                )
+
+        if self.nao_encontrados:
+            logger.info("=" * 60)
+            logger.info("REPOSITÓRIOS NÃO ENCONTRADOS NO CLOUD")
+            logger.info("=" * 60)
+
+            for slug in self.nao_encontrados:
+                logger.warning("%s", slug)
+
+        logger.info("Processo finalizado.")
+
 
 def configurar_argumentos():
     parser = argparse.ArgumentParser(
@@ -304,12 +436,12 @@ def configurar_argumentos():
 
     grupo.add_argument(
         "--projeto",
-        help="Migra todos os repositórios do projeto informado.",
+        help="Projeto de origem no Server e destino no Cloud.",
     )
 
     grupo.add_argument(
         "--repo",
-        help="Migra somente um repositório pelo slug.",
+        help="Migra somente um repositório pelo slug, dentro do projeto CRED.",
     )
 
     parser.add_argument(

@@ -46,27 +46,3 @@ class BitbucketServer:
             start = dados["nextPageStart"]
 
         return repositorios
-
-
-def main():
-    bitbucket = BitbucketServer()
-
-    repositorios = bitbucket.listar_repositorios("cred")
-
-    print(f"\nTotal de repositórios: {len(repositorios)}")
-    print("=" * 60)
-
-    for repo in repositorios:
-        print(f"Nome: {repo['name']}")
-        print(f"Slug: {repo['slug']}")
-        print(f"Projeto: {repo['project']['key']}")
-
-        for clone in repo.get("links", {}).get("clone", []):
-            if clone.get("name") == "ssh":
-                print(f"Clone SSH: {clone['href']}")
-
-        print("-" * 60)
-
-
-if __name__ == "__main__":
-    main()

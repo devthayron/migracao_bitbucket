@@ -5,6 +5,8 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
+    VERIFICAR_REFERENCIAS_DESTINO: bool = True
+
     # Bitbucket Server
     BITBUCKET_SERVER_URL: str
     BITBUCKET_SERVER_PORT: int

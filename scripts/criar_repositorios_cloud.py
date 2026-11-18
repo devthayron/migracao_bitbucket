@@ -1,5 +1,4 @@
 import argparse
-import json
 import logging
 import sys
 from pathlib import Path
@@ -10,19 +9,19 @@ sys.path.insert(0, str(RAIZ_PROJETO))
 from bitbucket_cloud import BitbucketCloud
 
 from logger import setup_logging
+from scripts.bitbucket_server import BitbucketServer
 
 logger = logging.getLogger(__name__)
 
-PROJETO_ORIGEM = "cred"
-
-DIRETORIO_DATA = RAIZ_PROJETO / "data" / PROJETO_ORIGEM
-ARQUIVO_JSON = DIRETORIO_DATA / "repositorios.json"
+PROJETO_ORIGEM = "CRED"
 
 
 class MigracaoRepositorios:
     def __init__(self, chave_projeto):
-        self.chave_projeto = chave_projeto
-        self.bitbucket = BitbucketCloud()
+        self.chave_projeto = chave_projeto.upper()
+
+        self.bitbucket_server = BitbucketServer()
+        self.bitbucket_cloud = BitbucketCloud()
 
         self.slugs_origem = []
         self.existentes = {}
@@ -32,17 +31,17 @@ class MigracaoRepositorios:
         self.erros = []
 
     def carregar_repositorios(self):
-        logger.info("Carregando inventário de repositórios...")
+        logger.info(
+            "Consultando repositórios no Bitbucket Server: %s",
+            PROJETO_ORIGEM,
+        )
 
-        if not ARQUIVO_JSON.exists():
-            raise FileNotFoundError(f"Arquivo não encontrado: {ARQUIVO_JSON}")
+        repositorios = self.bitbucket_server.listar_repositorios(PROJETO_ORIGEM)
 
-        dados = json.loads(ARQUIVO_JSON.read_text(encoding="utf-8"))
-
-        if not isinstance(dados, dict):
-            raise ValueError("Formato inesperado do arquivo JSON.")
-
-        repositorios = dados.get("values", [])
+        if not repositorios:
+            raise ValueError(
+                f"Nenhum repositório encontrado no projeto {PROJETO_ORIGEM}."
+            )
 
         self.slugs_origem = sorted(
             {
@@ -53,7 +52,7 @@ class MigracaoRepositorios:
         )
 
         if not self.slugs_origem:
-            raise ValueError("Nenhum repositório encontrado em repositorios.json.")
+            raise ValueError("Nenhum slug de repositório encontrado na origem.")
 
         logger.info(
             "Repositórios encontrados na origem: %s",
@@ -99,7 +98,7 @@ class MigracaoRepositorios:
             )
 
             try:
-                sucesso, mensagem = self.bitbucket.criar_repositorio(
+                sucesso, mensagem = self.bitbucket_cloud.criar_repositorio(
                     slug,
                     self.chave_projeto,
                 )
@@ -152,11 +151,11 @@ class MigracaoRepositorios:
     def executar(self, confirmar=False):
         self.carregar_repositorios()
 
-        projeto = self.bitbucket.validar_projeto(self.chave_projeto)
+        projeto = self.bitbucket_cloud.validar_projeto(self.chave_projeto)
 
         logger.info("Projeto de destino: %s", projeto.get("name"))
         logger.info("Chave: %s", projeto.get("key"))
-        logger.info("Workspace: %s", self.bitbucket.workspace)
+        logger.info("Workspace: %s", self.bitbucket_cloud.workspace)
         logger.info(
             "Modo: %s",
             "EXECUÇÃO REAL" if confirmar else "SIMULAÇÃO",
@@ -164,7 +163,7 @@ class MigracaoRepositorios:
 
         logger.info("Consultando repositórios existentes no Cloud...")
 
-        self.existentes = self.bitbucket.listar_repositorios()
+        self.existentes = self.bitbucket_cloud.listar_repositorios()
 
         logger.info(
             "Repositórios encontrados no Cloud: %s",
